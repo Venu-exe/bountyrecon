@@ -7,13 +7,17 @@
 
 Features:
   • Subdomain Discovery    — bruteforce + certificate transparency
+  • Subdomain Takeover     — fingerprints dangling CNAMEs against known services
   • Port Scanner           — fast threaded TCP scanning
   • Security Header Audit  — checks all OWASP recommended headers
+  • HTTP Methods Check     — flags TRACE/PUT/DELETE and other risky verbs
   • Tech Stack Fingerprint — detects frameworks, servers, CDNs
   • DNS Recon              — A, AAAA, MX, NS, TXT, CNAME records
   • SSL/TLS Analysis       — cert info, expiry, weak ciphers
   • Wayback URLs           — fetches archived URLs from Wayback Machine
   • Directory Bruteforce   — finds hidden paths and endpoints
+  • CORS Misconfig Check   — tests origin reflection and wildcard ACAO
+  • Open Redirect Check    — tests common redirect params for unvalidated jumps
   • Auto Report            — generates H1-ready markdown reports
 
 Usage:
@@ -633,6 +637,83 @@ def mod_ssl_analysis(target: str, report: Report):
 
 
 # ============================================================
+# MODULE: HTTP METHODS CHECK
+# ============================================================
+RISKY_METHODS = {
+    "TRACE":   "high",    # Cross-Site Tracing (XST) — can expose cookies/headers
+    "TRACK":   "high",    # IIS variant of TRACE
+    "PUT":     "medium",  # May allow arbitrary file upload if unauthenticated
+    "DELETE":  "medium",  # May allow arbitrary resource deletion if unauthenticated
+    "CONNECT": "medium",  # Can indicate open proxy behavior
+    "PATCH":   "low",
+}
+
+
+def mod_http_methods(target: str, report: Report):
+    """Check for dangerous HTTP methods enabled on the server."""
+    section("HTTP Methods Check", "")
+
+    for scheme in ("https", "http"):
+        base_url = f"{scheme}://{target}"
+        try:
+            req = urllib.request.Request(base_url, method="OPTIONS")
+            req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) BountyRecon/1.0")
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+            allow = resp.headers.get("Allow", "") or resp.headers.get("Access-Control-Allow-Methods", "")
+            info(f"Scanning {base_url}")
+            break
+        except urllib.error.HTTPError as e:
+            allow = e.headers.get("Allow", "") if e.headers else ""
+            info(f"Scanning {base_url}")
+            break
+        except Exception:
+            allow = None
+            continue
+    else:
+        fail("Could not connect to target")
+        report.add("HTTP Methods", "Could not connect to target", "info")
+        return
+
+    advertised = [m.strip().upper() for m in allow.split(",")] if allow else []
+    if advertised:
+        found("Allowed Methods (via OPTIONS)", ", ".join(advertised), "info")
+        report.add("HTTP Methods", f"Server advertises: {', '.join(advertised)}", "info")
+    else:
+        info("Server did not return an Allow header for OPTIONS")
+
+    # Actively confirm risky methods respond (advertised Allow headers aren't always accurate)
+    risky_found = 0
+    for method, sev in RISKY_METHODS.items():
+        try:
+            req = urllib.request.Request(base_url, method=method)
+            req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) BountyRecon/1.0")
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=8, context=ctx)
+            code = resp.getcode()
+            if code < 400:
+                risky_found += 1
+                found(f"Method {method}", f"Enabled — HTTP {code}", sev)
+                report.add("HTTP Methods", f"{method} method appears enabled (HTTP {code})", sev,
+                           "Verify manually — unauthenticated write/trace methods are high-value findings")
+        except urllib.error.HTTPError as e:
+            if e.code < 400:
+                risky_found += 1
+                found(f"Method {method}", f"Enabled — HTTP {e.code}", sev)
+                report.add("HTTP Methods", f"{method} method appears enabled (HTTP {e.code})", sev)
+        except Exception:
+            pass
+
+    if risky_found == 0:
+        info("No risky HTTP methods appear enabled")
+        report.add("HTTP Methods", "No risky HTTP methods detected", "good")
+
+
+# ============================================================
 # MODULE: TECH FINGERPRINT
 # ============================================================
 TECH_SIGNATURES = {
@@ -848,6 +929,95 @@ def mod_subdomain_enum(target: str, report: Report, fast: bool = False):
             report.add("Subdomains", f"{fqdn} → {ip}", "info")
 
     info(f"Discovered {C.GREEN}{len(discovered)}{C.RESET} live subdomains")
+
+
+# ============================================================
+# MODULE: SUBDOMAIN TAKEOVER CHECK
+# ============================================================
+# Well-known fingerprints returned by unclaimed/dangling cloud endpoints.
+# Reference class of checks popularized by the "can-i-take-over-xyz" project.
+TAKEOVER_SIGNATURES = {
+    "There isn't a GitHub Pages site here": "GitHub Pages",
+    "NoSuchBucket": "AWS S3 Bucket",
+    "The specified bucket does not exist": "AWS S3 Bucket",
+    "herokucdn.com/error-pages/no-such-app": "Heroku",
+    "No such app": "Heroku",
+    "Fastly error: unknown domain": "Fastly",
+    "There's nothing here yet": "Netlify / Ghost",
+    "project not found": "Netlify",
+    "Sorry, this shop is currently unavailable": "Shopify",
+    "The feed has not been found": "Feedpress",
+    "is not a registered InCloud YouTrack": "YouTrack",
+    "InvalidBucketName": "AWS S3 Bucket",
+    "Repository not found": "Bitbucket",
+    "This UserVoice subdomain is currently available": "UserVoice",
+    "unrecognized-domain": "Cargo Collective",
+}
+
+
+def mod_subdomain_takeover(target: str, report: Report, fast: bool = False):
+    """Passively fingerprint discovered subdomains for dangling/takeover-able CNAMEs."""
+    section("Subdomain Takeover Check", "")
+
+    info("Gathering candidate subdomains...")
+    ct_subs = crt_sh_subdomains(target)
+
+    all_subs = set(SUBDOMAIN_WORDLIST)
+    for sub in ct_subs:
+        if sub.endswith(f".{target}"):
+            prefix = sub[: -(len(target) + 1)]
+            all_subs.add(prefix)
+
+    if fast:
+        all_subs = set(list(all_subs)[:40])
+
+    total = len(all_subs)
+    info(f"Resolving {total} candidate subdomains...")
+    print()
+
+    discovered = {}
+    checked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+        futures = {
+            executor.submit(resolve_subdomain, sub, target): sub
+            for sub in all_subs
+        }
+        for future in concurrent.futures.as_completed(futures):
+            checked += 1
+            progress(checked, total, f"{checked}/{total} resolved")
+            result = future.result()
+            if result:
+                fqdn, ip = result
+                discovered[fqdn] = ip
+
+    print()
+    if not discovered:
+        info("No resolvable subdomains to fingerprint")
+        return
+
+    info(f"Fingerprinting {len(discovered)} live subdomains for takeover signatures...")
+
+    flagged = 0
+    for fqdn in sorted(discovered):
+        body = None
+        for scheme in ("https", "http"):
+            body = http_get_text(f"{scheme}://{fqdn}", timeout=8)
+            if body:
+                break
+        if not body:
+            continue
+
+        for signature, service in TAKEOVER_SIGNATURES.items():
+            if signature.lower() in body.lower():
+                flagged += 1
+                found(f"Possible takeover: {fqdn}", f"matches {service} fingerprint", "high")
+                report.add("Subdomain Takeover", f"{fqdn} matches '{service}' dangling-service fingerprint",
+                           "high", f"Signature matched: \"{signature}\" — verify CNAME manually before reporting")
+                break
+
+    if flagged == 0:
+        info("No takeover fingerprints matched (does not guarantee safety — verify CNAMEs manually)")
+        report.add("Subdomain Takeover", "No known takeover fingerprints matched", "good")
 
 
 # ============================================================
@@ -1072,6 +1242,77 @@ def mod_cors_check(target: str, report: Report):
 
 
 # ============================================================
+# MODULE: OPEN REDIRECT CHECK
+# ============================================================
+REDIRECT_PARAMS = [
+    "redirect", "redirect_uri", "redirect_url", "url", "next", "return",
+    "returnTo", "return_url", "dest", "destination", "continue", "goto",
+    "target", "out", "view", "checkout_url", "image_url", "redir", "r",
+]
+
+OPEN_REDIRECT_PAYLOAD = "https://evil-bountyrecon-test.com"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevents urllib from silently following redirects so we can inspect them."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def check_open_redirect(base_url: str, param: str) -> Optional[Tuple[str, int, str]]:
+    """Test a single parameter name for open redirect behavior."""
+    test_url = f"{base_url}/?{param}={urllib.parse.quote(OPEN_REDIRECT_PAYLOAD, safe='')}"
+    try:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        req = urllib.request.Request(test_url)
+        req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) BountyRecon/1.0")
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener.open(req, timeout=8)
+        return None  # No redirect occurred
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            location = e.headers.get("Location", "") if e.headers else ""
+            if "evil-bountyrecon-test.com" in location:
+                return (param, e.code, location)
+    except Exception:
+        pass
+    return None
+
+
+def mod_open_redirect(target: str, report: Report):
+    """Check common redirect parameters for unvalidated open redirects."""
+    section("Open Redirect Check", "")
+
+    base_url = f"https://{target}"
+    if not http_head(base_url):
+        base_url = f"http://{target}"
+
+    info(f"Testing {len(REDIRECT_PARAMS)} common redirect parameters on {base_url}")
+
+    flagged = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(check_open_redirect, base_url, param): param
+            for param in REDIRECT_PARAMS
+        }
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                flagged.append(result)
+
+    if flagged:
+        for param, code, location in flagged:
+            found(f"Param '{param}'", f"HTTP {code} → {location}", "medium")
+            report.add("Open Redirect", f"Parameter '{param}' allows redirect to external domain",
+                       "medium", f"HTTP {code} → Location: {location}")
+    else:
+        info("No open redirects found on tested parameters")
+        report.add("Open Redirect", "No open redirects detected on common parameters", "good")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 MODULES = {
@@ -1081,9 +1322,12 @@ MODULES = {
     "ssl":       ("SSL/TLS Analysis",       mod_ssl_analysis),
     "tech":      ("Tech Fingerprint",       mod_tech_fingerprint),
     "subs":      ("Subdomain Discovery",    mod_subdomain_enum),
+    "takeover":  ("Subdomain Takeover",     mod_subdomain_takeover),
+    "methods":   ("HTTP Methods Check",     mod_http_methods),
     "wayback":   ("Wayback Machine",        mod_wayback),
     "dirs":      ("Directory Bruteforce",   mod_dir_bruteforce),
     "cors":      ("CORS Check",            mod_cors_check),
+    "redirect":  ("Open Redirect Check",    mod_open_redirect),
 }
 
 
@@ -1144,7 +1388,7 @@ Examples:
         mod_label, mod_func = MODULES[mod_name]
         try:
             # Some modules accept 'fast' parameter
-            if mod_name in ("ports", "subs"):
+            if mod_name in ("ports", "subs", "takeover"):
                 mod_func(target, report, fast=args.fast)
             else:
                 mod_func(target, report)
