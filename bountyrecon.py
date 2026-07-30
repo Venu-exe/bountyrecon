@@ -167,15 +167,6 @@ class Report:
         })
 
     def generate(self, output_dir: str) -> str:
-        sev_emoji = {
-            "critical",
-            "high",
-            "medium",
-            "low",
-            "info",
-            "good",
-        }
-
         lines = []
         lines.append(f"# BountyRecon Report — {self.target}")
         lines.append(f"\n**Date:** {self.timestamp}")
@@ -195,7 +186,7 @@ class Report:
         lines.append(f"|----------|-------|")
         for sev in ["critical", "high", "medium", "low", "info", "good"]:
             if sev_counts[sev]:
-                lines.append(f"| {sev_emoji.get(sev, '')} {sev.upper()} | {sev_counts[sev]} |")
+                lines.append(f"| {sev.upper()} | {sev_counts[sev]} |")
         lines.append(f"| **Total** | **{total}** |")
         lines.append("")
 
@@ -203,8 +194,7 @@ class Report:
             lines.append(f"## {sec_name}")
             lines.append("")
             for f in findings:
-                emoji = sev_emoji.get(f["severity"], )
-                lines.append(f"- {emoji} **[{f['severity'].upper()}]** {f['finding']}")
+                lines.append(f"- **[{f['severity'].upper()}]** {f['finding']}")
                 if f["detail"]:
                     lines.append(f"  - {f['detail']}")
             lines.append("")
