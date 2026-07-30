@@ -43,7 +43,7 @@ Every finding is scored (`critical` / `high` / `medium` / `low` / `info` / `good
 No dependencies — just Python 3.8+.
 
 ```bash
-git clone https://github.com/<your-username>/bountyrecon.git
+git clone https://github.com/Venu-exe/bountyrecon.git
 cd bountyrecon
 python3 bountyrecon.py -h
 ```
